@@ -9,7 +9,7 @@
       </div>
       <div class="drone-list">
         <div
-          v-for="drone in drones"
+          v-for="drone in droneList"
           :key="drone.id"
           class="drone-card"
           :class="{ active: selectedDrone === drone.id }"
@@ -40,20 +40,13 @@
 </template>
 
 <script setup>
-import { ref, onMounted, onUnmounted, reactive } from 'vue'
+import { ref, reactive, computed, onMounted, onUnmounted } from 'vue'
 import * as THREE from 'three'
 import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js'
 
 const canvasContainer = ref(null)
 const isConnected = ref(false)
 const selectedDrone = ref(null)
-const drones = reactive([])
-
-let scene, camera, renderer, controls
-let droneMeshes = {}
-let targetPositions = {}
-let animationId
-let ws
 
 const droneColors = {
   'DRONE-A': 0x00ffff,
@@ -63,7 +56,66 @@ const droneColors = {
   'DRONE-E': 0x9d4edd
 }
 
+const droneMap = reactive({})
+const droneList = computed(() => Object.values(droneMap).sort((a, b) => a.id.localeCompare(b.id)))
+
+let scene, camera, renderer, controls
+const droneMeshes = {}
+const targetPositions = {}
+const pendingData = {}
+let animationId
+let ws
+let wsReconnectTimer
+
+let sharedGeometries = {}
+let sharedMaterials = {}
+let disposableObjects = []
+
+const RENDER_INTERVAL = 1000 / 30
+let lastRenderSync = 0
+
+function createSharedAssets() {
+  sharedGeometries.sphere = new THREE.SphereGeometry(1.5, 24, 24)
+  sharedGeometries.glow = new THREE.SphereGeometry(2.5, 24, 24)
+  sharedGeometries.ring = new THREE.TorusGeometry(3, 0.1, 6, 24)
+  sharedGeometries.farm = new THREE.BoxGeometry(100, 5, 100)
+  sharedGeometries.tree = new THREE.ConeGeometry(1.5, 4, 6)
+
+  Object.keys(droneColors).forEach((id) => {
+    const color = droneColors[id]
+    sharedMaterials[`sphere_${id}`] = new THREE.MeshStandardMaterial({
+      color,
+      emissive: color,
+      emissiveIntensity: 0.6,
+      roughness: 0.3,
+      metalness: 0.7
+    })
+    sharedMaterials[`glow_${id}`] = new THREE.MeshBasicMaterial({
+      color,
+      transparent: true,
+      opacity: 0.25,
+      depthWrite: false
+    })
+    sharedMaterials[`ring_${id}`] = new THREE.MeshBasicMaterial({
+      color,
+      transparent: true,
+      opacity: 0.6,
+      depthWrite: false
+    })
+  })
+
+  sharedMaterials.farm = new THREE.MeshStandardMaterial({
+    color: 0x2d6a4f,
+    roughness: 0.8,
+    metalness: 0.1
+  })
+  sharedMaterials.farmEdge = new THREE.LineBasicMaterial({ color: 0x52b788 })
+  sharedMaterials.tree = new THREE.MeshStandardMaterial({ color: 0x40916c })
+}
+
 function initScene() {
+  createSharedAssets()
+
   const container = canvasContainer.value
   const width = container.clientWidth
   const height = container.clientHeight
@@ -97,43 +149,36 @@ function initScene() {
 function addLights() {
   const ambientLight = new THREE.AmbientLight(0x404060, 0.6)
   scene.add(ambientLight)
+  disposableObjects.push(ambientLight)
 
-  const directionalLight = new THREE.DirectionalLight(0xffffff, 0.8)
+  const directionalLight = new THREE.DirectionalLight(0xffffff, 0.9)
   directionalLight.position.set(50, 100, 50)
   directionalLight.castShadow = true
-  directionalLight.shadow.mapSize.width = 2048
-  directionalLight.shadow.mapSize.height = 2048
+  directionalLight.shadow.mapSize.width = 1024
+  directionalLight.shadow.mapSize.height = 1024
   scene.add(directionalLight)
+  disposableObjects.push(directionalLight)
 
-  const pointLight = new THREE.PointLight(0x00ff88, 0.5, 200)
-  pointLight.position.set(0, 50, 0)
-  scene.add(pointLight)
+  const hemiLight = new THREE.HemisphereLight(0x52b788, 0x1b4332, 0.3)
+  scene.add(hemiLight)
+  disposableObjects.push(hemiLight)
 }
 
 function addFarmland() {
-  const farmGeometry = new THREE.BoxGeometry(100, 5, 100)
-  const farmMaterial = new THREE.MeshStandardMaterial({
-    color: 0x2d6a4f,
-    roughness: 0.8,
-    metalness: 0.1
-  })
-  const farm = new THREE.Mesh(farmGeometry, farmMaterial)
+  const farm = new THREE.Mesh(sharedGeometries.farm, sharedMaterials.farm)
   farm.position.y = -2.5
   farm.receiveShadow = true
   scene.add(farm)
+  disposableObjects.push(farm)
 
-  const edgeGeometry = new THREE.EdgesGeometry(farmGeometry)
-  const edgeMaterial = new THREE.LineBasicMaterial({ color: 0x52b788 })
-  const edges = new THREE.LineSegments(edgeGeometry, edgeMaterial)
+  const edgeGeometry = new THREE.EdgesGeometry(sharedGeometries.farm)
+  const edges = new THREE.LineSegments(edgeGeometry, sharedMaterials.farmEdge)
   edges.position.y = -2.5
   scene.add(edges)
+  disposableObjects.push(edges, edgeGeometry)
 
   for (let i = 0; i < 20; i++) {
-    const treeGeometry = new THREE.ConeGeometry(1.5, 4, 6)
-    const treeMaterial = new THREE.MeshStandardMaterial({
-      color: 0x40916c
-    })
-    const tree = new THREE.Mesh(treeGeometry, treeMaterial)
+    const tree = new THREE.Mesh(sharedGeometries.tree, sharedMaterials.tree)
     const angle = Math.random() * Math.PI * 2
     const radius = 45 + Math.random() * 5
     tree.position.set(
@@ -143,6 +188,7 @@ function addFarmland() {
     )
     tree.castShadow = true
     scene.add(tree)
+    disposableObjects.push(tree)
   }
 }
 
@@ -150,50 +196,33 @@ function addGrid() {
   const gridHelper = new THREE.GridHelper(100, 20, 0x52b788, 0x1b4332)
   gridHelper.position.y = 0.01
   scene.add(gridHelper)
+  disposableObjects.push(gridHelper)
 }
 
-function createDroneMesh(drone) {
+function createDroneMesh(droneId) {
   const group = new THREE.Group()
 
-  const sphereGeometry = new THREE.SphereGeometry(1.5, 32, 32)
-  const sphereMaterial = new THREE.MeshStandardMaterial({
-    color: droneColors[drone.id] || 0x00ffff,
-    emissive: droneColors[drone.id] || 0x00ffff,
-    emissiveIntensity: 0.5,
-    roughness: 0.3,
-    metalness: 0.7
-  })
-  const sphere = new THREE.Mesh(sphereGeometry, sphereMaterial)
+  const sphere = new THREE.Mesh(
+    sharedGeometries.sphere,
+    sharedMaterials[`sphere_${droneId}`] || sharedMaterials['sphere_DRONE-A']
+  )
   sphere.castShadow = true
   group.add(sphere)
 
-  const glowGeometry = new THREE.SphereGeometry(2.5, 32, 32)
-  const glowMaterial = new THREE.MeshBasicMaterial({
-    color: droneColors[drone.id] || 0x00ffff,
-    transparent: true,
-    opacity: 0.2
-  })
-  const glow = new THREE.Mesh(glowGeometry, glowMaterial)
+  const glow = new THREE.Mesh(
+    sharedGeometries.glow,
+    sharedMaterials[`glow_${droneId}`] || sharedMaterials['glow_DRONE-A']
+  )
   group.add(glow)
 
-  const ringGeometry = new THREE.TorusGeometry(3, 0.1, 8, 32)
-  const ringMaterial = new THREE.MeshBasicMaterial({
-    color: droneColors[drone.id] || 0x00ffff,
-    transparent: true,
-    opacity: 0.6
-  })
-  const ring = new THREE.Mesh(ringGeometry, ringMaterial)
+  const ring = new THREE.Mesh(
+    sharedGeometries.ring,
+    sharedMaterials[`ring_${droneId}`] || sharedMaterials['ring_DRONE-A']
+  )
   ring.rotation.x = Math.PI / 2
   group.add(ring)
 
-  const pointLight = new THREE.PointLight(
-    droneColors[drone.id] || 0x00ffff,
-    1,
-    20
-  )
-  group.add(pointLight)
-
-  group.position.set(drone.x, drone.y, drone.z)
+  group.position.set(0, 10, 0)
   scene.add(group)
 
   return { group, sphere, glow, ring }
@@ -214,73 +243,102 @@ function connectWebSocket() {
 
   ws.onopen = () => {
     isConnected.value = true
-    console.log('WebSocket connected')
+    if (wsReconnectTimer) {
+      clearTimeout(wsReconnectTimer)
+      wsReconnectTimer = null
+    }
   }
 
   ws.onmessage = (event) => {
-    const data = JSON.parse(event.data)
-    updateDrones(data)
+    try {
+      const data = JSON.parse(event.data)
+      if (Array.isArray(data)) {
+        data.forEach((d) => {
+          pendingData[d.id] = d
+        })
+      }
+    } catch (e) {
+      console.error('Parse WebSocket message error:', e)
+    }
   }
 
   ws.onclose = () => {
     isConnected.value = false
-    console.log('WebSocket disconnected, retrying...')
-    setTimeout(connectWebSocket, 3000)
+    if (!wsReconnectTimer) {
+      wsReconnectTimer = setTimeout(connectWebSocket, 3000)
+    }
   }
 
-  ws.onerror = (error) => {
-    console.error('WebSocket error:', error)
+  ws.onerror = () => {
+    try { ws.close() } catch (e) {}
   }
 }
 
-function updateDrones(data) {
-  data.forEach((d, index) => {
-    if (index < drones.length) {
-      drones[index].x = d.x
-      drones[index].y = d.y
-      drones[index].z = d.z
-      drones[index].battery = d.battery
+function syncPendingToState() {
+  const ids = Object.keys(pendingData)
+  if (ids.length === 0) return
+
+  for (const id of ids) {
+    const d = pendingData[id]
+
+    if (!droneMap[id]) {
+      droneMap[id] = { id: d.id, x: d.x, y: d.y, z: d.z, battery: d.battery }
     } else {
-      drones.push({ ...d })
+      droneMap[id].x = d.x
+      droneMap[id].y = d.y
+      droneMap[id].z = d.z
+      droneMap[id].battery = d.battery
     }
 
-    targetPositions[d.id] = { x: d.x, y: d.y, z: d.z }
+    targetPositions[id] = { x: d.x, y: d.y, z: d.z }
 
-    if (!droneMeshes[d.id]) {
-      droneMeshes[d.id] = createDroneMesh(d)
+    if (!droneMeshes[id]) {
+      droneMeshes[id] = createDroneMesh(id)
     }
-  })
+  }
+
+  for (const id of Object.keys(pendingData)) {
+    delete pendingData[id]
+  }
 }
 
-function animate() {
+function animate(timestamp = 0) {
   animationId = requestAnimationFrame(animate)
 
-  Object.keys(droneMeshes).forEach((id) => {
+  if (timestamp - lastRenderSync >= RENDER_INTERVAL) {
+    syncPendingToState()
+    lastRenderSync = timestamp
+  }
+
+  const ids = Object.keys(droneMeshes)
+  for (let i = 0; i < ids.length; i++) {
+    const id = ids[i]
     const mesh = droneMeshes[id]
     const target = targetPositions[id]
 
     if (target) {
-      mesh.group.position.x += (target.x - mesh.group.position.x) * 0.05
-      mesh.group.position.y += (target.y - mesh.group.position.y) * 0.05
-      mesh.group.position.z += (target.z - mesh.group.position.z) * 0.05
+      mesh.group.position.x += (target.x - mesh.group.position.x) * 0.08
+      mesh.group.position.y += (target.y - mesh.group.position.y) * 0.08
+      mesh.group.position.z += (target.z - mesh.group.position.z) * 0.08
     }
 
     mesh.ring.rotation.z += 0.02
-    mesh.glow.scale.setScalar(1 + Math.sin(Date.now() * 0.003) * 0.1)
+    const pulse = 1 + Math.sin(timestamp * 0.003 + i) * 0.1
+    mesh.glow.scale.setScalar(pulse)
 
     if (selectedDrone.value === id) {
       mesh.group.scale.setScalar(1.3)
     } else {
       mesh.group.scale.setScalar(1)
     }
-  })
+  }
 
   controls.update()
   renderer.render(scene, camera)
 }
 
 function handleResize() {
-  if (!canvasContainer.value) return
+  if (!canvasContainer.value || !renderer || !camera) return
   const width = canvasContainer.value.clientWidth
   const height = canvasContainer.value.clientHeight
   camera.aspect = width / height
@@ -288,17 +346,59 @@ function handleResize() {
   renderer.setSize(width, height)
 }
 
+function disposeAll() {
+  Object.keys(droneMeshes).forEach((id) => {
+    const { group } = droneMeshes[id]
+    scene.remove(group)
+  })
+  Object.keys(droneMeshes).length = 0
+
+  disposableObjects.forEach((obj) => {
+    if (obj.geometry) obj.geometry.dispose?.()
+    if (obj.material) {
+      if (Array.isArray(obj.material)) {
+        obj.material.forEach((m) => m.dispose?.())
+      } else {
+        obj.material.dispose?.()
+      }
+    }
+    scene.remove?.(obj)
+  })
+  disposableObjects = []
+
+  Object.values(sharedGeometries).forEach((g) => g.dispose?.())
+  Object.values(sharedMaterials).forEach((m) => m.dispose?.())
+  sharedGeometries = {}
+  sharedMaterials = {}
+
+  controls?.dispose?.()
+  renderer?.dispose?.()
+  renderer?.forceContextLoss?.()
+
+  if (renderer?.domElement?.parentNode) {
+    renderer.domElement.parentNode.removeChild(renderer.domElement)
+  }
+
+  scene = null
+  camera = null
+  renderer = null
+  controls = null
+}
+
 onMounted(() => {
   initScene()
   connectWebSocket()
-  window.addEventListener('resize', handleResize)
+  window.addEventListener('resize', handleResize, { passive: true })
 })
 
 onUnmounted(() => {
   window.removeEventListener('resize', handleResize)
   if (animationId) cancelAnimationFrame(animationId)
-  if (ws) ws.close()
-  if (renderer) renderer.dispose()
+  if (wsReconnectTimer) clearTimeout(wsReconnectTimer)
+  if (ws) {
+    try { ws.close() } catch (e) {}
+  }
+  disposeAll()
 })
 </script>
 
@@ -413,7 +513,6 @@ onUnmounted(() => {
   font-weight: 600;
   padding: 4px 10px;
   border-radius: 20px;
-  background: rgba(82, 183, 136, 0.2);
 }
 
 .drone-battery.high {
