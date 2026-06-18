@@ -12,11 +12,17 @@
           v-for="drone in droneList"
           :key="drone.id"
           class="drone-card"
-          :class="{ active: selectedDrone === drone.id }"
+          :class="{
+            active: selectedDrone === drone.id,
+            warning: isLowBattery(drone.battery)
+          }"
           @click="selectDrone(drone.id)"
         >
           <div class="drone-header">
-            <span class="drone-id">{{ drone.id }}</span>
+            <span class="drone-id" :class="{ warnid: isLowBattery(drone.battery) }">
+              {{ drone.id }}
+              <span v-if="isLowBattery(drone.battery)" class="warn-sign">⚠</span>
+            </span>
             <span class="drone-battery" :class="batteryClass(drone.battery)">
               {{ Math.round(drone.battery) }}%
             </span>
@@ -56,6 +62,8 @@ const droneColors = {
   'DRONE-E': 0x9d4edd
 }
 
+const LOW_BATTERY = 20
+
 const droneMap = reactive({})
 const droneList = computed(() => Object.values(droneMap).sort((a, b) => a.id.localeCompare(b.id)))
 
@@ -73,6 +81,18 @@ let disposableObjects = []
 
 const RENDER_INTERVAL = 1000 / 30
 let lastRenderSync = 0
+
+const TRAIL_MAX_POINTS = 120
+const TRAIL_ADD_INTERVAL = 0.08
+const droneTrailStates = {}
+
+let sprayCanvas, sprayCtx, sprayTexture, sprayMesh
+const SPRAY_CANVAS_SIZE = 512
+const FARM_SIZE = 100
+
+function isLowBattery(battery) {
+  return battery < LOW_BATTERY
+}
 
 function createSharedAssets() {
   sharedGeometries.sphere = new THREE.SphereGeometry(1.5, 24, 24)
@@ -102,6 +122,12 @@ function createSharedAssets() {
       opacity: 0.6,
       depthWrite: false
     })
+    sharedMaterials[`trail_${id}`] = new THREE.LineBasicMaterial({
+      color,
+      transparent: true,
+      opacity: 0.55,
+      depthWrite: false
+    })
   })
 
   sharedMaterials.farm = new THREE.MeshStandardMaterial({
@@ -111,6 +137,26 @@ function createSharedAssets() {
   })
   sharedMaterials.farmEdge = new THREE.LineBasicMaterial({ color: 0x52b788 })
   sharedMaterials.tree = new THREE.MeshStandardMaterial({ color: 0x40916c })
+
+  sharedMaterials.sphereWarning = new THREE.MeshStandardMaterial({
+    color: 0xff1a1a,
+    emissive: 0xff0000,
+    emissiveIntensity: 1.2,
+    roughness: 0.2,
+    metalness: 0.8
+  })
+  sharedMaterials.glowWarning = new THREE.MeshBasicMaterial({
+    color: 0xff1a1a,
+    transparent: true,
+    opacity: 0.45,
+    depthWrite: false
+  })
+  sharedMaterials.ringWarning = new THREE.MeshBasicMaterial({
+    color: 0xff3333,
+    transparent: true,
+    opacity: 0.85,
+    depthWrite: false
+  })
 }
 
 function initScene() {
@@ -142,6 +188,7 @@ function initScene() {
 
   addLights()
   addFarmland()
+  addSprayOverlay()
   addGrid()
   animate()
 }
@@ -192,6 +239,60 @@ function addFarmland() {
   }
 }
 
+function addSprayOverlay() {
+  sprayCanvas = document.createElement('canvas')
+  sprayCanvas.width = SPRAY_CANVAS_SIZE
+  sprayCanvas.height = SPRAY_CANVAS_SIZE
+  sprayCtx = sprayCanvas.getContext('2d')
+
+  sprayCtx.fillStyle = '#2d6a4f'
+  sprayCtx.fillRect(0, 0, SPRAY_CANVAS_SIZE, SPRAY_CANVAS_SIZE)
+
+  sprayTexture = new THREE.CanvasTexture(sprayCanvas)
+  sprayTexture.wrapS = THREE.ClampToEdgeWrapping
+  sprayTexture.wrapT = THREE.ClampToEdgeWrapping
+  sprayTexture.needsUpdate = true
+
+  const sprayGeometry = new THREE.PlaneGeometry(FARM_SIZE, FARM_SIZE)
+  const sprayMaterial = new THREE.MeshStandardMaterial({
+    map: sprayTexture,
+    transparent: true,
+    opacity: 0.85,
+    roughness: 0.9,
+    metalness: 0
+  })
+  sprayMesh = new THREE.Mesh(sprayGeometry, sprayMaterial)
+  sprayMesh.rotation.x = -Math.PI / 2
+  sprayMesh.position.y = 0.05
+  sprayMesh.receiveShadow = true
+  scene.add(sprayMesh)
+
+  disposableObjects.push(sprayMesh, sprayGeometry, sprayMaterial, sprayTexture)
+}
+
+function paintSpray(droneId, worldX, worldZ, radius = 6) {
+  const u = ((worldX + FARM_SIZE / 2) / FARM_SIZE) * SPRAY_CANVAS_SIZE
+  const v = (1 - (worldZ + FARM_SIZE / 2) / FARM_SIZE) * SPRAY_CANVAS_SIZE
+  const pxRadius = (radius / FARM_SIZE) * SPRAY_CANVAS_SIZE
+
+  const color = droneColors[droneId]
+  const r = (color >> 16) & 0xff
+  const g = (color >> 8) & 0xff
+  const b = color & 0xff
+
+  const grad = sprayCtx.createRadialGradient(u, v, 0, u, v, pxRadius)
+  grad.addColorStop(0, `rgba(${r}, ${g}, ${b}, 0.55)`)
+  grad.addColorStop(0.5, `rgba(${r}, ${g}, ${b}, 0.25)`)
+  grad.addColorStop(1, `rgba(${r}, ${g}, ${b}, 0)`)
+
+  sprayCtx.fillStyle = grad
+  sprayCtx.beginPath()
+  sprayCtx.arc(u, v, pxRadius, 0, Math.PI * 2)
+  sprayCtx.fill()
+
+  sprayTexture.needsUpdate = true
+}
+
 function addGrid() {
   const gridHelper = new THREE.GridHelper(100, 20, 0x52b788, 0x1b4332)
   gridHelper.position.y = 0.01
@@ -201,6 +302,7 @@ function addGrid() {
 
 function createDroneMesh(droneId) {
   const group = new THREE.Group()
+  const baseColor = droneColors[droneId] || 0x00ffff
 
   const sphere = new THREE.Mesh(
     sharedGeometries.sphere,
@@ -222,10 +324,102 @@ function createDroneMesh(droneId) {
   ring.rotation.x = Math.PI / 2
   group.add(ring)
 
+  const trailPositions = new Float32Array(TRAIL_MAX_POINTS * 3)
+  const trailGeometry = new THREE.BufferGeometry()
+  trailGeometry.setAttribute('position', new THREE.BufferAttribute(trailPositions, 3))
+  trailGeometry.setDrawRange(0, 0)
+
+  const trail = new THREE.Line(
+    trailGeometry,
+    sharedMaterials[`trail_${droneId}`] || sharedMaterials['trail_DRONE-A']
+  )
+  scene.add(trail)
+
   group.position.set(0, 10, 0)
   scene.add(group)
 
-  return { group, sphere, glow, ring }
+  droneTrailStates[droneId] = {
+    positions: trailPositions,
+    geometry: trailGeometry,
+    trail,
+    count: 0,
+    head: 0,
+    lastAddedTime: 0,
+    prevWorldX: 0,
+    prevWorldZ: 0
+  }
+
+  return {
+    group,
+    sphere,
+    glow,
+    ring,
+    baseColor,
+    isWarning: false
+  }
+}
+
+function addTrailPoint(droneId, x, y, z, timestamp) {
+  const state = droneTrailStates[droneId]
+  if (!state) return
+
+  const elapsed = (timestamp - state.lastAddedTime) / 1000
+  if (elapsed < TRAIL_ADD_INTERVAL && state.count > 0) return
+
+  state.lastAddedTime = timestamp
+
+  const idx = (state.head % TRAIL_MAX_POINTS) * 3
+  state.positions[idx] = x
+  state.positions[idx + 1] = y
+  state.positions[idx + 2] = z
+
+  state.head++
+  if (state.count < TRAIL_MAX_POINTS) state.count++
+
+  const sorted = new Float32Array(TRAIL_MAX_POINTS * 3)
+  if (state.count < TRAIL_MAX_POINTS) {
+    sorted.set(state.positions.subarray(0, state.count * 3))
+  } else {
+    const start = state.head % TRAIL_MAX_POINTS
+    const part1 = state.positions.subarray(start * 3)
+    const part2 = state.positions.subarray(0, start * 3)
+    sorted.set(part1)
+    sorted.set(part2, part1.length)
+  }
+  state.geometry.attributes.position.array.set(sorted)
+  state.geometry.attributes.position.needsUpdate = true
+  state.geometry.setDrawRange(0, state.count)
+
+  const paintX = state.count === 1 ? x : (x + state.prevWorldX) / 2
+  const paintZ = state.count === 1 ? z : (z + state.prevWorldZ) / 2
+  paintSpray(droneId, paintX, paintZ, 5)
+
+  state.prevWorldX = x
+  state.prevWorldZ = z
+}
+
+function applyWarningStyle(mesh, enable) {
+  if (mesh.isWarning === enable) return
+  mesh.isWarning = enable
+
+  if (enable) {
+    mesh.sphere.material = sharedMaterials.sphereWarning
+    mesh.glow.material = sharedMaterials.glowWarning
+    mesh.ring.material = sharedMaterials.ringWarning
+  } else {
+    const id = findDroneIdByMesh(mesh)
+    mesh.sphere.material = sharedMaterials[`sphere_${id}`] || sharedMaterials['sphere_DRONE-A']
+    mesh.glow.material = sharedMaterials[`glow_${id}`] || sharedMaterials['glow_DRONE-A']
+    mesh.ring.material = sharedMaterials[`ring_${id}`] || sharedMaterials['ring_DRONE-A']
+  }
+}
+
+function findDroneIdByMesh(targetMesh) {
+  const keys = Object.keys(droneMeshes)
+  for (let i = 0; i < keys.length; i++) {
+    if (droneMeshes[keys[i]] === targetMesh) return keys[i]
+  }
+  return 'DRONE-A'
 }
 
 function selectDrone(id) {
@@ -233,6 +427,7 @@ function selectDrone(id) {
 }
 
 function batteryClass(battery) {
+  if (battery < LOW_BATTERY) return 'critical'
   if (battery > 60) return 'high'
   if (battery > 30) return 'medium'
   return 'low'
@@ -326,6 +521,19 @@ function animate(timestamp = 0) {
     const pulse = 1 + Math.sin(timestamp * 0.003 + i) * 0.1
     mesh.glow.scale.setScalar(pulse)
 
+    addTrailPoint(
+      id,
+      mesh.group.position.x,
+      mesh.group.position.y,
+      mesh.group.position.z,
+      timestamp
+    )
+
+    const drone = droneMap[id]
+    if (drone) {
+      applyWarningStyle(mesh, drone.battery < LOW_BATTERY)
+    }
+
     if (selectedDrone.value === id) {
       mesh.group.scale.setScalar(1.3)
     } else {
@@ -351,7 +559,13 @@ function disposeAll() {
     const { group } = droneMeshes[id]
     scene.remove(group)
   })
+  Object.keys(droneTrailStates).forEach((id) => {
+    const state = droneTrailStates[id]
+    scene.remove(state.trail)
+    state.geometry.dispose?.()
+  })
   Object.keys(droneMeshes).length = 0
+  Object.keys(droneTrailStates).length = 0
 
   disposableObjects.forEach((obj) => {
     if (obj.geometry) obj.geometry.dispose?.()
@@ -362,6 +576,7 @@ function disposeAll() {
         obj.material.dispose?.()
       }
     }
+    if (obj.isTexture) obj.dispose?.()
     scene.remove?.(obj)
   })
   disposableObjects = []
@@ -370,6 +585,9 @@ function disposeAll() {
   Object.values(sharedMaterials).forEach((m) => m.dispose?.())
   sharedGeometries = {}
   sharedMaterials = {}
+
+  sprayCanvas = null
+  sprayCtx = null
 
   controls?.dispose?.()
   renderer?.dispose?.()
@@ -495,6 +713,27 @@ onUnmounted(() => {
   box-shadow: 0 0 20px rgba(82, 183, 136, 0.3);
 }
 
+.drone-card.warning {
+  background: rgba(255, 26, 26, 0.15);
+  border-color: rgba(255, 51, 51, 0.7);
+  animation: warning-blink 0.9s ease-in-out infinite;
+}
+
+.drone-card.warning:hover {
+  background: rgba(255, 51, 51, 0.25);
+  border-color: #ff3333;
+}
+
+@keyframes warning-blink {
+  0%, 100% {
+    box-shadow: 0 0 0 rgba(255, 51, 51, 0);
+  }
+  50% {
+    box-shadow: 0 0 28px rgba(255, 51, 51, 0.75);
+    background: rgba(255, 51, 51, 0.28);
+  }
+}
+
 .drone-header {
   display: flex;
   justify-content: space-between;
@@ -506,6 +745,30 @@ onUnmounted(() => {
   color: #d8f3dc;
   font-size: 16px;
   font-weight: 600;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.drone-id.warnid {
+  color: #ff4444;
+  text-shadow: 0 0 8px rgba(255, 51, 51, 0.8);
+  animation: text-flash 0.9s ease-in-out infinite;
+}
+
+@keyframes text-flash {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.5; }
+}
+
+.warn-sign {
+  font-size: 18px;
+  animation: warn-shake 0.45s ease-in-out infinite;
+}
+
+@keyframes warn-shake {
+  0%, 100% { transform: rotate(-8deg); }
+  50% { transform: rotate(8deg); }
 }
 
 .drone-battery {
@@ -526,8 +789,19 @@ onUnmounted(() => {
 }
 
 .drone-battery.low {
-  color: #ff6b6b;
-  background: rgba(255, 107, 107, 0.15);
+  color: #ff9500;
+  background: rgba(255, 149, 0, 0.15);
+}
+
+.drone-battery.critical {
+  color: #ff3333;
+  background: rgba(255, 51, 51, 0.22);
+  animation: bat-crit-flash 0.9s ease-in-out infinite;
+}
+
+@keyframes bat-crit-flash {
+  0%, 100% { transform: scale(1); }
+  50% { transform: scale(1.08); }
 }
 
 .battery-bar {
@@ -554,7 +828,17 @@ onUnmounted(() => {
 }
 
 .battery-fill.low {
-  background: linear-gradient(90deg, #e76f51, #ff6b6b);
+  background: linear-gradient(90deg, #f4a261, #ff9500);
+}
+
+.battery-fill.critical {
+  background: linear-gradient(90deg, #e63946, #ff1a1a);
+  animation: fill-pulse 0.9s ease-in-out infinite;
+}
+
+@keyframes fill-pulse {
+  0%, 100% { filter: brightness(1); }
+  50% { filter: brightness(1.6); }
 }
 
 .drone-coords {
